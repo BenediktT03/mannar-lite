@@ -1,8 +1,6 @@
- <?php
-/**
- * Firebase Configuration for PHP CMS
- * This file handles the connection between PHP and Firebase services
- */
+<?php
+// Namespace muss die erste Anweisung nach dem PHP-Tag sein
+namespace Mannar\CMS;
 
 // Prevent direct access to this file
 if (!defined('CMS_ACCESS')) {
@@ -11,10 +9,14 @@ if (!defined('CMS_ACCESS')) {
 }
 
 // Require Firebase PHP SDK via Composer
-require_once __DIR__ . '/vendor/autoload.php';
+require_once __DIR__ . '/../../vendor/autoload.php';
 
 use Kreait\Firebase\Factory;
 use Kreait\Firebase\ServiceAccount;
+use Kreait\Firebase\Auth;
+use Kreait\Firebase\Firestore;
+use Kreait\Firebase\Storage;
+use Kreait\Firebase\Exception\FirebaseException;
 
 class FirebaseConfig {
     private static $instance = null;
@@ -22,48 +24,67 @@ class FirebaseConfig {
     private $firestore;
     private $storage;
     private $auth;
-
-    // Firebase project configuration
-    private $config = [
-        'apiKey' => 'AIzaSyAQszUApKHZ3lPrpc7HOINpdOWW3SgvUBM',
-        'authDomain' => 'mannar-129a5.firebaseapp.com',
-        'databaseURL' => 'https://YOUR_PROJECT_ID.firebaseio.com',
-        'projectId' => 'mannar-129a5',
-        'storageBucket' => 'mannar-129a5.firebasestorage.app',
-        'messagingSenderId' => '687710492532',
-        'appId' => '1:687710492532:web:c7b675da541271f8d83e21',
-        'measurementId' => 'G-NXBLYJ5CXL'
-    ];
+    private $defaultBucket;
+    private $config;
 
     // Private constructor for singleton pattern
     private function __construct() {
-        try {
-            // Path to your service account JSON file
-            $serviceAccountPath = __DIR__ . '/service-account.json';
-            
-            // Create Firebase instance
-            $factory = (new Factory)
-                ->withServiceAccount($serviceAccountPath)
-                ->withDatabaseUri('https://' . $this->config['projectId'] . '.firebaseio.com');
-            
-            $this->firebase = $factory->createFirebase();
-            
-            // Initialize services
-            $this->firestore = $this->firebase->firestore();
-            $this->storage = $this->firebase->storage();
-            $this->auth = $this->firebase->auth();
-            
-        } catch (Exception $e) {
-            die('Firebase initialization error: ' . $e->getMessage());
-        }
+        $this->loadConfig();
+        $this->initFirebase();
     }
 
     // Get singleton instance
     public static function getInstance() {
-        if (self::$instance == null) {
-            self::$instance = new FirebaseConfig();
+        if (self::$instance === null) {
+            self::$instance = new self();
         }
         return self::$instance;
+    }
+
+    // Load configuration from JSON file
+    private function loadConfig() {
+        $configPath = __DIR__ . '/../config/firebase-config.json';
+        
+        if (!file_exists($configPath)) {
+            throw new \Exception('Firebase-Konfigurationsdatei nicht gefunden: ' . $configPath);
+        }
+        
+        $configJson = file_get_contents($configPath);
+        $this->config = json_decode($configJson, true);
+        
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            throw new \Exception('Fehler beim Parsen der Firebase-Konfiguration: ' . json_last_error_msg());
+        }
+        
+        // Standard-Bucket aus Konfiguration laden
+        $this->defaultBucket = $this->config['storage']['default_bucket'] ?? 'default-bucket';
+    }
+
+    // Initialize Firebase
+    private function initFirebase() {
+        $credentialsPath = __DIR__ . '/../config/firebase-credentials.json';
+        
+        if (!file_exists($credentialsPath)) {
+            throw new \Exception('Firebase-Credentials nicht gefunden: ' . $credentialsPath);
+        }
+        
+        try {
+            $this->firebase = (new Factory)
+                ->withServiceAccount($credentialsPath)
+                ->withDatabaseUri($this->config['database_url'] ?? '');
+                
+            // Dienste instanziieren
+            $this->auth = $this->firebase->createAuth();
+            $this->firestore = $this->firebase->createFirestore();
+            $this->storage = $this->firebase->createStorage();
+        } catch (FirebaseException $e) {
+            throw new \Exception('Firebase-Initialisierungsfehler: ' . $e->getMessage());
+        }
+    }
+
+    // Get Firebase Authentication instance
+    public function getAuth() {
+        return $this->auth;
     }
 
     // Get Firestore database instance
@@ -76,9 +97,47 @@ class FirebaseConfig {
         return $this->storage;
     }
 
-    // Get Firebase Authentication instance
-    public function getAuth() {
-        return $this->auth;
+    // Get default bucket for storage
+    public function getDefaultBucket() {
+        return $this->defaultBucket;
+    }
+
+    // Get configuration value
+    public function getConfig($key, $default = null) {
+        $keys = explode('.', $key);
+        $value = $this->config;
+        
+        foreach ($keys as $k) {
+            if (!isset($value[$k])) {
+                return $default;
+            }
+            $value = $value[$k];
+        }
+        
+        return $value;
+    }
+
+    // Check if services are initialized
+    public function checkServices() {
+        return [
+            'auth' => $this->auth !== null,
+            'firestore' => $this->firestore !== null,
+            'storage' => $this->storage !== null
+        ];
+    }
+
+    // Get error messages for uninitialized services
+    public function getServiceErrors() {
+        $errors = [];
+        $services = $this->checkServices();
+        
+        foreach ($services as $service => $initialized) {
+            if (!$initialized) {
+                $errors[$service] = "Firebase-$service wurde nicht initialisiert.";
+            }
+        }
+        
+        return $errors;
     }
 
     // Get Firebase configuration for JavaScript

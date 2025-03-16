@@ -1,671 +1,530 @@
- <?php
-// Include configuration
-require_once 'config-loader.php';
+<?php
+/**
+ * WYSIWYG Editor Controller
+ * 
+ * Controller für den TinyMCE-Editor mit Medien-Upload und Inhaltsverwaltung.
+ * Ermöglicht das Erstellen und Bearbeiten von Inhalten im CMS.
+ */
 
-// Start session if not already started
-if (session_status() === PHP_SESSION_NONE) {
-    session_start();
+namespace App\Controllers;
+
+require_once __DIR__ . '/../Config/FirebaseConfig.php';
+
+use App\Config\FirebaseConfig;
+
+class EditorController
+{
+    private $firebase;
+    private $firestore;
+    private $storage;
+    private $auth;
+    private $postId;
+    private $postType;
+    private $postData;
+
+    /**
+     * Konstruktor - Initialisiert die Firebase-Verbindung
+     */
+    public function __construct()
+    {
+        $this->firebase = FirebaseConfig::getInstance();
+        $this->firestore = $this->firebase->getFirestore();
+        $this->storage = $this->firebase->getStorage();
+        $this->auth = $this->firebase->getAuth();
+        
+        // Post-ID und Typ aus den Anfrageparametern ermitteln
+        $this->postId = $_GET['id'] ?? null;
+        $this->postType = $_GET['type'] ?? 'post';
+        
+        // Vorhandenen Post laden, falls eine ID angegeben wurde
+        if ($this->postId) {
+            $this->loadPost();
+        }
+    }
+
+    /**
+     * Hauptansicht des Editors anzeigen
+     * 
+     * @return void
+     */
+    public function index()
+    {
+        // Berechtigungsprüfung
+        if (!isset($_SESSION['user_id']) || !$this->checkPermission('content_edit')) {
+            $_SESSION['error'] = 'Sie haben keine Berechtigung, Inhalte zu bearbeiten.';
+            header('Location: index.php');
+            exit;
+        }
+
+        // Kategorien laden
+        $categories = $this->getCategories();
+        
+        // Tags laden
+        $tags = $this->getTags();
+        
+        // TinyMCE-Konfiguration
+        $editorConfig = $this->getEditorConfig();
+        
+        // An die View übergeben
+        include __DIR__ . '/../Views/editor/index.php';
+    }
+
+    /**
+     * Inhalt speichern
+     * 
+     * @return void
+     */
+    public function save()
+    {
+        // Berechtigungsprüfung
+        if (!isset($_SESSION['user_id']) || !$this->checkPermission('content_edit')) {
+            $this->jsonResponse(['success' => false, 'message' => 'Keine Berechtigung']);
+            exit;
+        }
+        
+        // POST-Daten prüfen
+        if (!isset($_POST['title']) || !isset($_POST['content'])) {
+            $this->jsonResponse(['success' => false, 'message' => 'Fehlende Pflichtfelder']);
+            exit;
+        }
+        
+        $title = trim($_POST['title']);
+        $content = $_POST['content'];
+        $excerpt = $_POST['excerpt'] ?? '';
+        $categoryIds = $_POST['categories'] ?? [];
+        $tagIds = $_POST['tags'] ?? [];
+        $status = $_POST['status'] ?? 'draft';
+        $slug = $_POST['slug'] ?? $this->generateSlug($title);
+        $featuredImage = $_POST['featured_image'] ?? '';
+        $seoTitle = $_POST['seo_title'] ?? $title;
+        $seoDescription = $_POST['seo_description'] ?? '';
+        $seoKeywords = $_POST['seo_keywords'] ?? '';
+        
+        // Daten für Firestore vorbereiten
+        $postData = [
+            'title' => $title,
+            'content' => $content,
+            'excerpt' => $excerpt,
+            'category_ids' => $categoryIds,
+            'tag_ids' => $tagIds,
+            'status' => $status,
+            'slug' => $slug,
+            'featured_image' => $featuredImage,
+            'seo' => [
+                'title' => $seoTitle,
+                'description' => $seoDescription,
+                'keywords' => $seoKeywords
+            ],
+            'author_id' => $_SESSION['user_id'],
+            'updated_at' => date('Y-m-d H:i:s')
+        ];
+        
+        // Neuen Post erstellen oder vorhandenen aktualisieren
+        try {
+            if ($this->postId) {
+                // Vorherige Version speichern
+                $this->saveVersion();
+                
+                // Post aktualisieren
+                $postRef = $this->firestore->collection($this->postType . 's')->document($this->postId);
+                $postRef->set($postData, ['merge' => true]);
+                
+                $result = [
+                    'success' => true,
+                    'message' => ucfirst($this->postType) . ' erfolgreich aktualisiert',
+                    'id' => $this->postId
+                ];
+            } else {
+                // Erstellungsdatum für neuen Post
+                $postData['created_at'] = date('Y-m-d H:i:s');
+                
+                // Neuen Post erstellen
+                $postRef = $this->firestore->collection($this->postType . 's')->newDocument();
+                $postRef->set($postData);
+                
+                $result = [
+                    'success' => true,
+                    'message' => ucfirst($this->postType) . ' erfolgreich erstellt',
+                    'id' => $postRef->id()
+                ];
+            }
+            
+            $this->jsonResponse($result);
+        } catch (\Exception $e) {
+            $this->jsonResponse([
+                'success' => false,
+                'message' => 'Fehler beim Speichern: ' . $e->getMessage()
+            ]);
+        }
+    }
+
+    /**
+     * Vorschau generieren
+     * 
+     * @return void
+     */
+    public function preview()
+    {
+        // Berechtigungsprüfung
+        if (!isset($_SESSION['user_id']) || !$this->checkPermission('content_view')) {
+            $this->jsonResponse(['success' => false, 'message' => 'Keine Berechtigung']);
+            exit;
+        }
+        
+        // POST-Daten holen
+        $title = $_POST['title'] ?? '';
+        $content = $_POST['content'] ?? '';
+        $featuredImage = $_POST['featured_image'] ?? '';
+        
+        // Vorschau-ID generieren
+        $previewId = md5(uniqid());
+        
+        // Vorschaudaten in Firestore speichern
+        $previewData = [
+            'title' => $title,
+            'content' => $content,
+            'featured_image' => $featuredImage,
+            'user_id' => $_SESSION['user_id'],
+            'created_at' => date('Y-m-d H:i:s'),
+            'expires_at' => date('Y-m-d H:i:s', time() + 3600) // 1 Stunde gültig
+        ];
+        
+        try {
+            $previewRef = $this->firestore->collection('previews')->document($previewId);
+            $previewRef->set($previewData);
+            
+            $previewUrl = 'preview.php?id=' . $previewId;
+            
+            $this->jsonResponse([
+                'success' => true,
+                'preview_id' => $previewId,
+                'preview_url' => $previewUrl
+            ]);
+        } catch (\Exception $e) {
+            $this->jsonResponse([
+                'success' => false,
+                'message' => 'Fehler beim Erstellen der Vorschau: ' . $e->getMessage()
+            ]);
+        }
+    }
+
+    /**
+     * Medien-Upload für den Editor
+     * 
+     * @return void
+     */
+    public function upload()
+    {
+        // Berechtigungsprüfung
+        if (!isset($_SESSION['user_id']) || !$this->checkPermission('media_upload')) {
+            $this->jsonResponse(['success' => false, 'message' => 'Keine Berechtigung']);
+            exit;
+        }
+        
+        // Prüfen, ob eine Datei hochgeladen wurde
+        if (!isset($_FILES['file']) || $_FILES['file']['error'] !== UPLOAD_ERR_OK) {
+            $this->jsonResponse(['success' => false, 'message' => 'Keine Datei hochgeladen']);
+            exit;
+        }
+        
+        $file = $_FILES['file'];
+        
+        // Dateityp prüfen
+        $allowedTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+        $finfo = finfo_open(FILEINFO_MIME_TYPE);
+        $mimeType = finfo_file($finfo, $file['tmp_name']);
+        finfo_close($finfo);
+        
+        if (!in_array($mimeType, $allowedTypes)) {
+            $this->jsonResponse(['success' => false, 'message' => 'Dateityp nicht erlaubt']);
+            exit;
+        }
+        
+        // Eindeutigen Dateinamen generieren
+        $extension = pathinfo($file['name'], PATHINFO_EXTENSION);
+        $filename = uniqid() . '.' . $extension;
+        $destination = 'editor/' . date('Y/m/d') . '/' . $filename;
+        
+        try {
+            // Storage-Bucket holen
+            $bucket = $this->storage->getBucket($this->firebase->getDefaultBucket());
+            
+            // Datei hochladen
+            $object = $bucket->upload(
+                fopen($file['tmp_name'], 'r'),
+                [
+                    'name' => $destination,
+                    'metadata' => [
+                        'contentType' => $mimeType,
+                        'uploadedBy' => $_SESSION['user_id'],
+                        'uploadedAt' => date('Y-m-d H:i:s')
+                    ]
+                ]
+            );
+            
+            // Öffentliche URL erhalten
+            $url = $object->signedUrl(new \DateTime('+1000 years'));
+            
+            // Erfolg zurückmelden
+            $this->jsonResponse([
+                'success' => true,
+                'file' => [
+                    'url' => $url,
+                    'title' => $file['name'],
+                    'path' => $destination
+                ]
+            ]);
+        } catch (\Exception $e) {
+            $this->jsonResponse([
+                'success' => false,
+                'message' => 'Fehler beim Hochladen: ' . $e->getMessage()
+            ]);
+        }
+    }
+
+    /**
+     * Vorhandenen Post laden
+     * 
+     * @return void
+     */
+    private function loadPost()
+    {
+        try {
+            $postRef = $this->firestore->collection($this->postType . 's')->document($this->postId);
+            $snapshot = $postRef->snapshot();
+            
+            if ($snapshot->exists()) {
+                $this->postData = $snapshot->data();
+            } else {
+                $this->postData = null;
+                $this->postId = null;
+            }
+        } catch (\Exception $e) {
+            $this->postData = null;
+        }
+    }
+
+    /**
+     * Kategorien abrufen
+     * 
+     * @return array Liste der Kategorien
+     */
+    private function getCategories()
+    {
+        try {
+            $categories = [];
+            $categoryRef = $this->firestore->collection('categories');
+            $documents = $categoryRef->documents();
+            
+            foreach ($documents as $document) {
+                $categories[] = [
+                    'id' => $document->id(),
+                    'name' => $document->data()['name'] ?? '',
+                    'parent_id' => $document->data()['parent_id'] ?? null
+                ];
+            }
+            
+            // Nach Hierarchie sortieren
+            $categories = $this->buildCategoryTree($categories);
+            
+            return $categories;
+        } catch (\Exception $e) {
+            return [];
+        }
+    }
+
+    /**
+     * Kategoriebaum aufbauen
+     * 
+     * @param array $categories Liste aller Kategorien
+     * @param string|null $parentId Elternkategorie-ID
+     * @param int $level Hierarchieebene
+     * @return array Hierarchischer Kategoriebaum
+     */
+    private function buildCategoryTree($categories, $parentId = null, $level = 0)
+    {
+        $tree = [];
+        
+        foreach ($categories as $category) {
+            if ($category['parent_id'] === $parentId) {
+                $category['level'] = $level;
+                $category['children'] = $this->buildCategoryTree($categories, $category['id'], $level + 1);
+                $tree[] = $category;
+            }
+        }
+        
+        return $tree;
+    }
+
+    /**
+     * Tags abrufen
+     * 
+     * @return array Liste der Tags
+     */
+    private function getTags()
+    {
+        try {
+            $tags = [];
+            $tagRef = $this->firestore->collection('tags');
+            $documents = $tagRef->documents();
+            
+            foreach ($documents as $document) {
+                $tags[] = [
+                    'id' => $document->id(),
+                    'name' => $document->data()['name'] ?? ''
+                ];
+            }
+            
+            return $tags;
+        } catch (\Exception $e) {
+            return [];
+        }
+    }
+
+    /**
+     * TinyMCE-Konfiguration erstellen
+     * 
+     * @return array Editor-Konfiguration
+     */
+    private function getEditorConfig()
+    {
+        return [
+            'selector' => '#content',
+            'height' => 500,
+            'menubar' => true,
+            'plugins' => [
+                'advlist', 'autolink', 'lists', 'link', 'image', 'charmap', 'preview',
+                'anchor', 'searchreplace', 'visualblocks', 'code', 'fullscreen',
+                'insertdatetime', 'media', 'table', 'help', 'wordcount'
+            ],
+            'toolbar' => 'undo redo | formatselect | bold italic | alignleft aligncenter alignright alignjustify | bullist numlist outdent indent | link image media | removeformat | help',
+            'images_upload_url' => 'editor.php?action=upload',
+            'automatic_uploads' => true,
+            'images_reuse_filename' => true,
+            'relative_urls' => false,
+            'remove_script_host' => false,
+            'convert_urls' => false
+        ];
+    }
+
+    /**
+     * Slug aus Titel generieren
+     * 
+     * @param string $title Titel
+     * @return string URL-freundlicher Slug
+     */
+    private function generateSlug($title)
+    {
+        // Umlaute und Sonderzeichen ersetzen
+        $replacements = [
+            'ä' => 'ae', 'ö' => 'oe', 'ü' => 'ue', 'ß' => 'ss',
+            'Ä' => 'Ae', 'Ö' => 'Oe', 'Ü' => 'Ue',
+            ' ' => '-', '&' => '-and-'
+        ];
+        
+        $slug = str_replace(array_keys($replacements), array_values($replacements), $title);
+        
+        // Nur alphanumerische Zeichen und Bindestriche erlauben
+        $slug = preg_replace('/[^a-zA-Z0-9-]/', '', $slug);
+        
+        // Mehrfache Bindestriche durch einen ersetzen
+        $slug = preg_replace('/-+/', '-', $slug);
+        
+        // Führende und abschließende Bindestriche entfernen
+        $slug = trim($slug, '-');
+        
+        // Kleinbuchstaben
+        $slug = strtolower($slug);
+        
+        return $slug;
+    }
+
+    /**
+     * Vorherige Version speichern
+     * 
+     * @return void
+     */
+    private function saveVersion()
+    {
+        if (!$this->postData) {
+            return;
+        }
+        
+        try {
+            $versionData = $this->postData;
+            $versionData['post_id'] = $this->postId;
+            $versionData['post_type'] = $this->postType;
+            $versionData['version_date'] = date('Y-m-d H:i:s');
+            $versionData['saved_by'] = $_SESSION['user_id'];
+            
+            $versionRef = $this->firestore->collection('versions')->newDocument();
+            $versionRef->set($versionData);
+        } catch (\Exception $e) {
+            // Versionierung fehlgeschlagen, aber Fehler ignorieren
+        }
+    }
+
+    /**
+     * Berechtigungen prüfen
+     * 
+     * @param string $permission Zu prüfende Berechtigung
+     * @return bool Berechtigung vorhanden oder nicht
+     */
+    private function checkPermission($permission)
+    {
+        // Einfache Implementierung - sollte gegen Firestore-Rollen geprüft werden
+        if (!isset($_SESSION['user_role'])) {
+            return false;
+        }
+        
+        $role = $_SESSION['user_role'];
+        
+        // Administrator hat alle Rechte
+        if ($role === 'admin') {
+            return true;
+        }
+        
+        // Berechtigungsmatrix
+        $permissions = [
+            'editor' => ['content_view', 'content_edit', 'content_delete', 'media_view', 'media_upload'],
+            'author' => ['content_view', 'content_edit', 'media_view', 'media_upload'],
+            'contributor' => ['content_view', 'content_edit_own', 'media_view']
+        ];
+        
+        return isset($permissions[$role]) && in_array($permission, $permissions[$role]);
+    }
+
+    /**
+     * JSON-Antwort senden
+     * 
+     * @param array $data Zu sendende Daten
+     * @return void
+     */
+    private function jsonResponse($data)
+    {
+        header('Content-Type: application/json');
+        echo json_encode($data);
+        exit;
+    }
 }
 
-// Get content type (post or page)
-$contentType = isset($_GET['type']) ? $_GET['type'] : 'post';
-$contentId = isset($_GET['id']) ? $_GET['id'] : null;
-$isEdit = !empty($contentId);
+// Controller-Initialisierung und Routing
+$editorController = new EditorController();
 
-// Set page title
-$pageTitle = ($isEdit ? 'Edit' : 'New') . ' ' . ucfirst($contentType);
-?>
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title><?php echo $pageTitle; ?> - PHP Firebase CMS</title>
-    <link rel="stylesheet" href="style.css">
-    <!-- TinyMCE Editor -->
-    <script src="https://cdn.tiny.cloud/1/no-api-key/tinymce/6/tinymce.min.js" referrerpolicy="origin"></script>
-    <style>
-        /* Editor-specific styles */
-        .editor-container {
-            display: grid;
-            grid-template-columns: 3fr 1fr;
-            gap: 20px;
-        }
-        
-        .editor-main {
-            flex: 3;
-        }
-        
-        .editor-sidebar {
-            flex: 1;
-            background-color: #f8f9fa;
-            padding: 1.5rem;
-            border-radius: 8px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.05);
-        }
-        
-        @media (max-width: 768px) {
-            .editor-container {
-                grid-template-columns: 1fr;
-            }
-        }
-        
-        .tox-tinymce {
-            border-radius: 4px;
-            border: 1px solid #e0e0e0 !important;
-        }
-        
-        #preview-frame {
-            width: 100%;
-            height: 500px;
-            border: 1px solid #e0e0e0;
-            border-radius: 4px;
-        }
-        
-        .tab-nav {
-            display: flex;
-            margin-bottom: 1rem;
-        }
-        
-        .tab-nav button {
-            padding: 0.5rem 1rem;
-            background-color: #f8f9fa;
-            border: 1px solid #e0e0e0;
-            border-bottom: none;
-            border-radius: 4px 4px 0 0;
-            cursor: pointer;
-            margin-right: 5px;
-        }
-        
-        .tab-nav button.active {
-            background-color: #fff;
-            border-bottom: 1px solid #fff;
-            margin-bottom: -1px;
-            position: relative;
-            z-index: 1;
-        }
-        
-        .tab-content {
-            border: 1px solid #e0e0e0;
-            border-radius: 0 4px 4px 4px;
-            padding: 1rem;
-            background-color: #fff;
-        }
-        
-        .tab-pane {
-            display: none;
-        }
-        
-        .tab-pane.active {
-            display: block;
-        }
-    </style>
-</head>
-<body>
-    <header>
-        <nav>
-            <div class="logo">PHP Firebase CMS</div>
-            <ul>
-                <li><a href="index.php">View Site</a></li>
-                <li><a href="admin.php">Admin</a></li>
-                <li><a href="dashboard.php">Dashboard</a></li>
-                <li><button id="logoutBtn">Logout</button></li>
-            </ul>
-        </nav>
-    </header>
+// Routing basierend auf der Aktion
+$action = $_GET['action'] ?? 'index';
 
-    <main>
-        <section>
-            <h1><?php echo $pageTitle; ?></h1>
-            <div id="auth-warning" class="alert alert-danger" style="display: none;">
-                <p>You must be logged in to access this page. Redirecting to login...</p>
-            </div>
-            
-            <div id="editor-container" style="display: none;">
-                <div class="editor-container">
-                    <div class="editor-main">
-                        <form id="content-form">
-                            <div class="form-group">
-                                <label for="content-title">Title</label>
-                                <input type="text" id="content-title" required>
-                            </div>
-                            
-                            <div class="form-group">
-                                <label for="content-slug">Slug</label>
-                                <input type="text" id="content-slug">
-                                <small>Leave blank to auto-generate from title</small>
-                            </div>
-                            
-                            <div class="form-group">
-                                <label for="content-excerpt">Excerpt</label>
-                                <textarea id="content-excerpt" rows="3"></textarea>
-                            </div>
-                            
-                            <div class="form-group">
-                                <label for="content-editor">Content</label>
-                                <textarea id="content-editor"></textarea>
-                            </div>
-                        </form>
-                    </div>
-                    
-                    <div class="editor-sidebar">
-                        <div class="form-group">
-                            <label for="content-status">Status</label>
-                            <select id="content-status">
-                                <option value="draft">Draft</option>
-                                <option value="published">Published</option>
-                            </select>
-                        </div>
-                        
-                        <?php if ($contentType === 'post'): ?>
-                        <div class="form-group">
-                            <label for="content-category">Category</label>
-                            <select id="content-category">
-                                <option value="">Select Category</option>
-                                <!-- Categories will be loaded dynamically -->
-                            </select>
-                        </div>
-                        
-                        <div class="form-group">
-                            <label for="content-tags">Tags</label>
-                            <input type="text" id="content-tags">
-                            <small>Separate tags with commas</small>
-                        </div>
-                        <?php endif; ?>
-                        
-                        <div class="form-group">
-                            <label for="content-featured-image">Featured Image</label>
-                            <input type="file" id="content-featured-image" accept="image/*">
-                            <div id="featured-image-preview"></div>
-                        </div>
-                        
-                        <div class="form-group">
-                            <button type="button" id="save-draft-btn" class="btn">Save Draft</button>
-                            <button type="button" id="publish-btn" class="btn btn-primary">Publish</button>
-                            <?php if ($isEdit): ?>
-                            <button type="button" id="preview-btn" class="btn">Preview</button>
-                            <?php endif; ?>
-                        </div>
-                        
-                        <div class="tab-nav">
-                            <button class="tab-btn active" data-tab="seo">SEO</button>
-                            <button class="tab-btn" data-tab="advanced">Advanced</button>
-                        </div>
-                        
-                        <div class="tab-content">
-                            <div id="seo-tab" class="tab-pane active">
-                                <div class="form-group">
-                                    <label for="meta-title">Meta Title</label>
-                                    <input type="text" id="meta-title">
-                                </div>
-                                <div class="form-group">
-                                    <label for="meta-description">Meta Description</label>
-                                    <textarea id="meta-description" rows="3"></textarea>
-                                </div>
-                            </div>
-                            
-                            <div id="advanced-tab" class="tab-pane">
-                                <div class="form-group">
-                                    <label for="content-template">Template</label>
-                                    <select id="content-template">
-                                        <option value="default">Default</option>
-                                        <option value="full-width">Full Width</option>
-                                        <option value="sidebar">With Sidebar</option>
-                                    </select>
-                                </div>
-                                
-                                <div class="form-group">
-                                    <label for="content-custom-css">Custom CSS</label>
-                                    <textarea id="content-custom-css" rows="5"></textarea>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-                
-                <!-- Preview Modal -->
-                <div id="preview-modal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background-color: rgba(0,0,0,0.7); z-index: 1000;">
-                    <div style="position: relative; width: 90%; height: 90%; margin: 2% auto; background-color: #fff; border-radius: 8px; overflow: hidden;">
-                        <button id="close-preview" style="position: absolute; top: 10px; right: 10px; background: none; border: none; font-size: 24px; cursor: pointer;">×</button>
-                        <iframe id="preview-frame" style="width: 100%; height: 100%; border: none;"></iframe>
-                    </div>
-                </div>
-            </div>
-        </section>
-    </main>
-
-    <footer>
-        <p>&copy; <?php echo date('Y'); ?> PHP Firebase CMS</p>
-    </footer>
-
-    <!-- Firebase SDK -->
-    <script type="module">
-        // Import Firebase functions
-        import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
-        import { getAuth, onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-auth.js";
-        import { getFirestore, collection, doc, getDoc, setDoc, updateDoc, addDoc, query, orderBy, getDocs } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js";
-        import { getStorage, ref, uploadBytesResumable, getDownloadURL } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-storage.js";
-
-        // Firebase configuration
-        const firebaseConfig = {
-            apiKey: "<?php echo FIREBASE_API_KEY; ?>",
-            authDomain: "<?php echo FIREBASE_AUTH_DOMAIN; ?>",
-            projectId: "<?php echo FIREBASE_PROJECT_ID; ?>",
-            storageBucket: "<?php echo FIREBASE_STORAGE_BUCKET; ?>",
-            messagingSenderId: "<?php echo FIREBASE_MESSAGING_SENDER_ID; ?>",
-            appId: "<?php echo FIREBASE_APP_ID; ?>",
-            measurementId: "<?php echo FIREBASE_MEASUREMENT_ID; ?>"
-        };
-
-        // Initialize Firebase
-        const app = initializeApp(firebaseConfig);
-        const auth = getAuth(app);
-        const db = getFirestore(app);
-        const storage = getStorage(app);
-        
-        // Content variables
-        const contentType = "<?php echo $contentType; ?>";
-        const contentId = "<?php echo $contentId; ?>";
-        const isEdit = <?php echo $isEdit ? 'true' : 'false'; ?>;
-        let contentData = null;
-        let featuredImageURL = null;
-        
-        // Initialize TinyMCE editor
-        tinymce.init({
-            selector: '#content-editor',
-            plugins: 'anchor autolink charmap codesample emoticons image link lists media searchreplace table visualblocks wordcount',
-            toolbar: 'undo redo | blocks fontfamily fontsize | bold italic underline strikethrough | link image media table | align lineheight | numlist bullist indent outdent | emoticons charmap | removeformat',
-            height: 500,
-            menubar: false,
-            setup: function(editor) {
-                editor.on('change', function() {
-                    editor.save();
-                });
-            },
-            // Image upload handler
-            images_upload_handler: function(blobInfo, progress) {
-                return new Promise((resolve, reject) => {
-                    const file = blobInfo.blob();
-                    const fileName = blobInfo.filename();
-                    
-                    // Create storage reference
-                    const storagePath = `content-images/${Date.now()}_${fileName}`;
-                    const storageRef = ref(storage, storagePath);
-                    
-                    // Upload file
-                    const uploadTask = uploadBytesResumable(storageRef, file);
-                    
-                    uploadTask.on('state_changed',
-                        (snapshot) => {
-                            // Track upload progress
-                            const progressValue = (snapshot.bytesTransferred / snapshot.totalBytes) * 100;
-                            progress(progressValue);
-                        },
-                        (error) => {
-                            reject(error.message);
-                        },
-                        async () => {
-                            // Upload completed successfully
-                            const downloadURL = await getDownloadURL(uploadTask.snapshot.ref);
-                            resolve(downloadURL);
-                        }
-                    );
-                });
-            }
-        });
-        
-        // Check authentication state
-        onAuthStateChanged(auth, async (user) => {
-            const editorContainer = document.getElementById('editor-container');
-            const authWarning = document.getElementById('auth-warning');
-            
-            if (user) {
-                // Check if user has permission to edit content
-                const userDoc = await getDoc(doc(db, "users", user.uid));
-                if (userDoc.exists() && (userDoc.data().role === 'admin' || userDoc.data().role === 'editor')) {
-                    // User has permission
-                    editorContainer.style.display = 'block';
-                    authWarning.style.display = 'none';
-                    
-                    // Initialize editor
-                    initializeEditor(user);
-                } else {
-                    // User does not have permission
-                    editorContainer.style.display = 'none';
-                    authWarning.innerHTML = '<p>You do not have permission to edit content. Redirecting to dashboard...</p>';
-                    authWarning.style.display = 'block';
-                    
-                    // Redirect to dashboard after 2 seconds
-                    setTimeout(() => {
-                        window.location.href = 'dashboard.php';
-                    }, 2000);
-                }
-            } else {
-                // User is not signed in
-                editorContainer.style.display = 'none';
-                authWarning.style.display = 'block';
-                
-                // Redirect to login after 2 seconds
-                setTimeout(() => {
-                    window.location.href = 'login.php';
-                }, 2000);
-            }
-        });
-        
-        // Logout functionality
-        document.getElementById('logoutBtn').addEventListener('click', () => {
-            signOut(auth).then(() => {
-                // Sign-out successful
-                window.location.href = 'index.php';
-            }).catch((error) => {
-                // An error happened
-                console.error('Logout error:', error);
-            });
-        });
-        
-        // Initialize editor
-        async function initializeEditor(user) {
-            // If editing existing content, load it
-            if (isEdit && contentId) {
-                try {
-                    const contentRef = doc(db, contentType + 's', contentId);
-                    const contentSnapshot = await getDoc(contentRef);
-                    
-                    if (contentSnapshot.exists()) {
-                        contentData = contentSnapshot.data();
-                        
-                        // Fill form fields
-                        document.getElementById('content-title').value = contentData.title || '';
-                        document.getElementById('content-slug').value = contentData.slug || '';
-                        document.getElementById('content-excerpt').value = contentData.excerpt || '';
-                        
-                        // Wait for TinyMCE to initialize
-                        tinymce.get('content-editor').setContent(contentData.content || '');
-                        
-                        document.getElementById('content-status').value = contentData.status || 'draft';
-                        
-                        if (contentType === 'post') {
-                            document.getElementById('content-category').value = contentData.category || '';
-                            document.getElementById('content-tags').value = contentData.tags ? contentData.tags.join(', ') : '';
-                        }
-                        
-                        // SEO data
-                        document.getElementById('meta-title').value = contentData.metaTitle || '';
-                        document.getElementById('meta-description').value = contentData.metaDescription || '';
-                        
-                        // Advanced options
-                        document.getElementById('content-template').value = contentData.template || 'default';
-                        document.getElementById('content-custom-css').value = contentData.customCSS || '';
-                        
-                        // Featured image
-                        if (contentData.featuredImage) {
-                            featuredImageURL = contentData.featuredImage;
-                            document.getElementById('featured-image-preview').innerHTML = `<img src="${featuredImageURL}" alt="Featured image" style="max-width: 100%; max-height: 200px; margin-top: 10px;">`;
-                        }
-                    } else {
-                        alert('Content not found!');
-                        window.location.href = 'admin.php';
-                    }
-                } catch (error) {
-                    console.error("Error loading content:", error);
-                    alert('Error loading content. Please try again.');
-                }
-            }
-            
-            // If content type is post, load categories
-            if (contentType === 'post') {
-                try {
-                    const categoriesQuery = query(collection(db, "categories"), orderBy("name"));
-                    const categoriesSnapshot = await getDocs(categoriesQuery);
-                    
-                    const categorySelect = document.getElementById('content-category');
-                    
-                    categoriesSnapshot.forEach((doc) => {
-                        const category = doc.data();
-                        const option = document.createElement('option');
-                        option.value = doc.id;
-                        option.textContent = category.name;
-                        categorySelect.appendChild(option);
-                    });
-                } catch (error) {
-                    console.error("Error loading categories:", error);
-                }
-            }
-            
-            // Set up tab navigation
-            document.querySelectorAll('.tab-btn').forEach(button => {
-                button.addEventListener('click', () => {
-                    const tabId = button.getAttribute('data-tab');
-                    
-                    // Update active button
-                    document.querySelectorAll('.tab-btn').forEach(btn => {
-                        btn.classList.remove('active');
-                    });
-                    button.classList.add('active');
-                    
-                    // Show selected tab
-                    document.querySelectorAll('.tab-pane').forEach(tab => {
-                        tab.classList.remove('active');
-                    });
-                    document.getElementById(tabId + '-tab').classList.add('active');
-                });
-            });
-            
-            // Featured image upload
-            document.getElementById('content-featured-image').addEventListener('change', async (e) => {
-                const file = e.target.files[0];
-                if (!file) return;
-                
-                try {
-                    // Create storage reference
-                    const storagePath = `featured-images/${Date.now()}_${file.name}`;
-                    const storageRef = ref(storage, storagePath);
-                    
-                    // Upload file
-                    const uploadTask = uploadBytesResumable(storageRef, file);
-                    
-                    uploadTask.on('state_changed',
-                        (snapshot) => {
-                            // Track upload progress
-                            const progress = (snapshot.bytesTransferred / snapshot.totalBytes) * 100;
-                            console.log('Upload progress:', progress);
-                        },
-                        (error) => {
-                            console.error("Upload error:", error);
-                            alert(`Error uploading featured image: ${error.message}`);
-                        },
-                        async () => {
-                            // Upload completed successfully
-                            featuredImageURL = await getDownloadURL(uploadTask.snapshot.ref);
-                            
-                            // Display image preview
-                            document.getElementById('featured-image-preview').innerHTML = `<img src="${featuredImageURL}" alt="Featured image" style="max-width: 100%; max-height: 200px; margin-top: 10px;">`;
-                        }
-                    );
-                } catch (error) {
-                    console.error("Error uploading featured image:", error);
-                    alert(`Error uploading featured image: ${error.message}`);
-                }
-            });
-            
-            // Auto-generate slug from title
-            document.getElementById('content-title').addEventListener('blur', () => {
-                const titleInput = document.getElementById('content-title');
-                const slugInput = document.getElementById('content-slug');
-                
-                if (titleInput.value && !slugInput.value) {
-                    // Create slug from title
-                    slugInput.value = createSlug(titleInput.value);
-                }
-            });
-            
-            // Save draft button
-            document.getElementById('save-draft-btn').addEventListener('click', () => {
-                saveContent('draft');
-            });
-            
-            // Publish button
-            document.getElementById('publish-btn').addEventListener('click', () => {
-                saveContent('published');
-            });
-            
-            // Preview button (only for edit mode)
-            if (isEdit) {
-                document.getElementById('preview-btn').addEventListener('click', () => {
-                    showPreview();
-                });
-                
-                // Close preview modal
-                document.getElementById('close-preview').addEventListener('click', () => {
-                    document.getElementById('preview-modal').style.display = 'none';
-                });
-            }
-        }
-        
-        // Save content
-        async function saveContent(status) {
-            // Get current user
-            const user = auth.currentUser;
-            if (!user) return;
-            
-            // Get form values
-            const title = document.getElementById('content-title').value;
-            const slug = document.getElementById('content-slug').value || createSlug(title);
-            const excerpt = document.getElementById('content-excerpt').value;
-            const content = tinymce.get('content-editor').getContent();
-            
-            // Additional fields
-            const metaTitle = document.getElementById('meta-title').value;
-            const metaDescription = document.getElementById('meta-description').value;
-            const template = document.getElementById('content-template').value;
-            const customCSS = document.getElementById('content-custom-css').value;
-            
-            // Post-specific fields
-            let category = '';
-            let tags = [];
-            
-            if (contentType === 'post') {
-                category = document.getElementById('content-category').value;
-                const tagsInput = document.getElementById('content-tags').value;
-                if (tagsInput) {
-                    tags = tagsInput.split(',').map(tag => tag.trim()).filter(tag => tag);
-                }
-            }
-            
-            // Validate required fields
-            if (!title) {
-                alert('Please enter a title.');
-                return;
-            }
-            
-            try {
-                // Prepare content data
-                const contentPayload = {
-                    title,
-                    slug,
-                    excerpt,
-                    content,
-                    status,
-                    metaTitle,
-                    metaDescription,
-                    template,
-                    customCSS,
-                    authorId: user.uid,
-                    authorName: user.displayName || user.email,
-                    updatedAt: new Date().toISOString()
-                };
-                
-                // Add post-specific fields
-                if (contentType === 'post') {
-                    contentPayload.category = category;
-                    contentPayload.tags = tags;
-                }
-                
-                // Add featured image if uploaded
-                if (featuredImageURL) {
-                    contentPayload.featuredImage = featuredImageURL;
-                }
-                
-                // Save to Firestore
-                if (isEdit) {
-                    // Update existing content
-                    await updateDoc(doc(db, contentType + 's', contentId), contentPayload);
-                    alert(`${contentType} updated successfully!`);
-                } else {
-                    // Create new content
-                    contentPayload.createdAt = new Date().toISOString();
-                    
-                    const newDocRef = await addDoc(collection(db, contentType + 's'), contentPayload);
-                    
-                    alert(`${contentType} created successfully!`);
-                    
-                    // Redirect to edit mode
-                    window.location.href = `editor.php?id=${newDocRef.id}&type=${contentType}`;
-                }
-            } catch (error) {
-                console.error(`Error saving ${contentType}:`, error);
-                alert(`Error saving ${contentType}. Please try again.`);
-            }
-        }
-        
-        // Show preview
-        function showPreview() {
-            // Create preview data
-            const title = document.getElementById('content-title').value;
-            const content = tinymce.get('content-editor').getContent();
-            
-            // Open preview modal
-            document.getElementById('preview-modal').style.display = 'block';
-            
-            // Generate preview HTML
-            const previewHTML = `
-                <!DOCTYPE html>
-                <html lang="en">
-                <head>
-                    <meta charset="UTF-8">
-                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                    <title>${title} - Preview</title>
-                    <link rel="stylesheet" href="style.css">
-                    <style>
-                        body {
-                            padding: 20px;
-                            max-width: 800px;
-                            margin: 0 auto;
-                        }
-                        h1 {
-                            margin-bottom: 20px;
-                        }
-                        .content {
-                            line-height: 1.6;
-                        }
-                        ${document.getElementById('content-custom-css').value || ''}
-                    </style>
-                </head>
-                <body>
-                    <h1>${title}</h1>
-                    <div class="content">
-                        ${content}
-                    </div>
-                </body>
-                </html>
-            `;
-            
-            // Set preview content
-            const previewFrame = document.getElementById('preview-frame');
-            previewFrame.contentWindow.document.open();
-            previewFrame.contentWindow.document.write(previewHTML);
-            previewFrame.contentWindow.document.close();
-        }
-        
-        // Helper function to create slug from title
-        function createSlug(text) {
-            return text
-                .toLowerCase()
-                .replace(/[^\w\s-]/g, '') // Remove special chars
-                .replace(/\s+/g, '-')     // Replace spaces with dashes
-                .replace(/-+/g, '-')      // Replace multiple dashes with single dash
-                .trim();                   // Trim whitespace
-        }
-    </script>
-</body>
-</html>
+switch ($action) {
+    case 'save':
+        $editorController->save();
+        break;
+    case 'preview':
+        $editorController->preview();
+        break;
+    case 'upload':
+        $editorController->upload();
+        break;
+    default:
+        $editorController->index();
+        break;
+}
